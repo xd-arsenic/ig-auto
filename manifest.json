@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "IG Auto",
+  "version": "1.0.0",
+  "description": "Bulk-follow followers/likers, track follows per account, and auto-unfollow on follow-back.",
+  "permissions": ["storage", "alarms", "cookies", "scripting", "tabs", "sidePanel"],
+  "host_permissions": ["*://*.instagram.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.instagram.com/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["*://*.instagram.com/*"],
+      "js": ["storage.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "IG Auto"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  }
+}

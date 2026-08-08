@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    @font-face {
+      font-family: 'Instrument Sans';
+      font-style: normal;
+      font-weight: 100 900;
+      font-display: swap;
+      src: url('fonts/instrument-sans.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+    @font-face {
+      font-family: 'Instrument Sans';
+      font-style: normal;
+      font-weight: 100 900;
+      font-display: swap;
+      src: url('fonts/instrument-sans-ext.woff2') format('woff2');
+      unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+    }
+
+    :root {
+      --ink: #1c1b1f;
+      --ink2: #3a3841;
+      --muted: #6d6a76;
+      --muted2: #8d8a96;
+      --muted3: #9b98a3;
+      --faint: #b3b0ba;
+      --line: #e8e6ed;
+      --line2: #f1eff5;
+      --line3: #f6f5f8;
+      --panel: #f6f5f8;
+      --rose: #c22a5c;
+      --grad: linear-gradient(135deg, #f5842b 0%, #e8385d 55%, #c22a86 100%);
+      --grad-h: linear-gradient(90deg, #e8385d, #c22a86);
+      --grad-bar: linear-gradient(90deg, #f5842b, #e8385d, #c22a86);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { width: 100%; height: 100%; }
+
+    body {
+      width: 100%;
+      min-width: 320px;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: var(--panel);
+      color: var(--ink);
+      font-family: 'Instrument Sans', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      font-size: 13px;
+    }
+    ::placeholder { color: #aeabb7; }
+    input, textarea { font-family: inherit; outline: none; }
+
+    .app { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; min-height: 100vh; }
+
+    [hidden] { display: none !important; }
+
+    /* ---- Header (gradient) ---- */
+    .hdr {
+      background: var(--grad);
+      padding: 14px 18px;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .hdr-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .brand { display: flex; align-items: center; gap: 9px; }
+    .brand-mark {
+      width: 30px; height: 30px; border-radius: 10px;
+      background: rgba(255,255,255,.2); border: 1px solid rgba(255,255,255,.35);
+      display: grid; place-items: center;
+    }
+    .brand-name { font-weight: 700; font-size: 16px; color: #fff; }
+    .brand.back { cursor: pointer; }
+    .brand.back .chev { color: rgba(255,255,255,.85); font-size: 15px; }
+    .brand.back .brand-name { font-size: 15px; }
+
+    .hdr-right { display: flex; align-items: center; gap: 10px; }
+    .acct-chip {
+      display: flex; align-items: center; gap: 5px;
+      background: rgba(255,255,255,.22); border-radius: 999px;
+      padding: 4px 10px; font-weight: 600; font-size: 11.5px; color: #fff;
+      max-width: 150px;
+    }
+    .acct-chip #accountLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .acct-dot { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,.5); flex: 0 0 auto; }
+    .acct-dot.on { background: #5cf58f; }
+    .hdr-ic { color: rgba(255,255,255,.8); font-size: 15px; cursor: pointer; line-height: 1; }
+    .hdr-ic:hover { color: #fff; }
+
+    .hdr-stats {
+      display: flex; gap: 12px; align-items: baseline;
+      font-weight: 500; font-size: 11.5px; color: rgba(255,255,255,.85);
+      white-space: nowrap; overflow: hidden;
+    }
+    .hdr-stats b { color: #fff; font-weight: 700; }
+    .hdr-stats .ago { margin-left: auto; color: rgba(255,255,255,.6); }
+
+    /* ---- Cards ---- */
+    .card {
+      background: #fff; border-radius: 13px; padding: 14px;
+      display: flex; flex-direction: column; gap: 10px;
+      box-shadow: 0 6px 20px rgba(120,20,80,.25);
+    }
+    .card-title { font-weight: 700; font-size: 13.5px; color: var(--ink); }
+
+    /* ---- Inputs ---- */
+    .inp {
+      width: 100%; border: 1.5px solid var(--line); border-radius: 9px;
+      padding: 9px 11px; font-weight: 500; font-size: 13px; color: var(--ink);
+      background: #fff;
+    }
+    textarea.inp { min-height: 40px; font-weight: 400; font-size: 12.5px; line-height: 1.5; resize: vertical; }
+    .inp:focus { border-color: #d9b8c8; }
+    #runInput { border-style: dashed; border-color: #e2dfe7; }
+
+    .frow { display: flex; flex-direction: column; gap: 6px; }
+    .flabel { font-weight: 400; font-size: 11px; color: var(--faint); }
+    .two { display: flex; gap: 8px; align-items: center; }
+    .two .inp { flex: 1; width: 0; }
+    .two .to { font-weight: 500; font-size: 12px; color: var(--faint); }
+
+    /* ---- Target chips ---- */
+    .chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; font-size: 11.5px; }
+    .chip { border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+    .chip.post { background: #fdeeee; color: #c93b3b; }
+    .chip.acct { background: #e9f2fe; color: #2a6bd6; }
+    .chip.add { color: #b8b5c0; background: transparent; padding: 4px 2px; }
+    .chip.add:hover { color: var(--ink); }
+    .chips-empty { font-weight: 400; font-size: 11px; color: var(--faint); }
+
+    /* ---- Human-likeness ---- */
+    .hl { display: flex; flex-direction: column; gap: 7px; border-top: 1px solid var(--line2); padding-top: 10px; }
+    .hl-head { display: flex; align-items: center; gap: 8px; }
+    .hl-title { font-weight: 600; font-size: 12.5px; color: var(--ink); }
+    .pace-pill { font-weight: 700; font-size: 11px; padding: 3px 9px; border-radius: 999px; }
+    .spacer { flex: 1; }
+    .adv-toggle { display: flex; align-items: center; gap: 3px; font-weight: 600; font-size: 11.5px; color: var(--muted2); cursor: pointer; }
+    .adv-toggle:hover { color: var(--ink); }
+    .adv-toggle .arrow { display: inline-block; transition: transform .15s; }
+    .adv-toggle.open .arrow { transform: rotate(90deg); }
+    .pace-desc { font-weight: 400; font-size: 11.5px; line-height: 1.5; color: var(--muted2); }
+    input[type="range"] { width: 100%; margin: 0; accent-color: #c22a86; cursor: pointer; }
+    .scale { display: flex; justify-content: space-between; font-weight: 600; font-size: 10px; color: var(--faint); letter-spacing: .6px; }
+
+    /* ---- Buttons ---- */
+    .run-actions { display: flex; gap: 8px; }
+    .btn-dark {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      background: var(--ink); color: #fff; border-radius: 10px; padding: 12px 0;
+      font-weight: 700; font-size: 13.5px; cursor: pointer;
+    }
+    .btn-dark:hover { opacity: .88; }
+    .dry {
+      display: flex; align-items: center; gap: 6px; justify-content: center;
+      border: 1.5px solid #e2dfe7; border-radius: 10px; padding: 0 12px;
+      font-weight: 600; font-size: 12px; color: var(--muted); cursor: pointer; background: #fff;
+    }
+    .dry.on { background: #fdf0f4; border-color: #f4d4dd; }
+    .dry .box {
+      width: 12px; height: 12px; border-radius: 4px; border: 1.5px solid #c4c1cb;
+      display: grid; place-items: center; font-size: 9px; color: var(--rose); background: #fff;
+    }
+    .btn-stop {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      border: 1.5px solid #f4d4dd; background: #fdf0f4; border-radius: 10px; padding: 11px 0;
+      font-weight: 700; font-size: 13px; color: var(--rose); cursor: pointer;
+    }
+
+    /* ---- Toggles ---- */
+    .trow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line3); }
+    .trow:last-child { border-bottom: none; }
+    .t-l { font-weight: 500; font-size: 12.5px; color: var(--ink2); }
+    .t-sub { font-weight: 400; font-size: 11px; color: var(--faint); margin-top: 1px; }
+    .tgl { flex: none; width: 32px; height: 19px; border-radius: 999px; position: relative; cursor: pointer; background: #e4e2e9; transition: background .15s; }
+    .tgl .knob { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s; }
+    .tgl.on { background: var(--grad-h); }
+    .tgl.on .knob { left: 15px; }
+
+    /* ---- Section labels ---- */
+    .sec { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 10.5px; color: var(--muted3); letter-spacing: .8px; }
+    .sec .line { flex: 1; height: 1px; background: var(--line); }
+    .sec.adv .line { background: var(--line2); }
+    .sec .link { font-weight: 500; letter-spacing: 0; cursor: pointer; }
+    .sec .link:hover { color: var(--ink); }
+
+    /* ---- Advanced panel ---- */
+    .advanced { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid var(--line2); padding-top: 12px; }
+
+    /* ---- Running card ---- */
+    .run-status { display: flex; align-items: center; gap: 7px; }
+    .run-status .dot { width: 7px; height: 7px; border-radius: 50%; }
+    .run-status .txt { font-weight: 700; font-size: 11px; letter-spacing: 1px; }
+    .run-status .next { margin-left: auto; font-weight: 500; font-size: 11px; color: var(--muted3); }
+    .run-count { display: flex; align-items: baseline; gap: 8px; }
+    .run-count .big { font-weight: 700; font-size: 34px; line-height: 1; color: var(--ink); letter-spacing: -1px; }
+    .run-count .sub { font-weight: 500; font-size: 12.5px; color: var(--muted2); }
+    .bar { height: 6px; background: var(--line2); border-radius: 3px; overflow: hidden; }
+    .bar-fill { height: 100%; background: var(--grad-bar); border-radius: 3px; transition: width .4s; width: 0; }
+
+    /* ---- Body ---- */
+    .body { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+
+    .queue-item { display: flex; align-items: center; gap: 8px; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 10px 13px; font-weight: 500; font-size: 12px; color: var(--ink2); }
+    .queue-item .left { margin-left: auto; color: var(--muted3); }
+    .queue-item .ic { color: #c93b3b; }
+    .queue-item .ic.acct { color: #2a6bd6; }
+
+    .locked { text-align: center; font-weight: 400; font-size: 11px; color: var(--faint); }
+
+    /* ---- Mini stat cards ---- */
+    .stat3 { display: flex; gap: 8px; }
+    .mini { flex: 1; background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; }
+    .mini-v { font-weight: 700; font-size: 17px; color: var(--ink); }
+    .mini-v.grad { background: var(--grad-h); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .mini-l { font-weight: 500; font-size: 10px; color: var(--muted3); }
+    .stat3.lg .mini { border-radius: 12px; padding: 11px 12px; }
+    .stat3.lg .mini-v { font-size: 20px; }
+    .stat3.lg .mini-l { font-size: 10.5px; }
+
+    /* ---- Chart ---- */
+    .chart { display: flex; align-items: flex-end; gap: 3px; height: 56px; }
+    .chart .bar2 { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+    .chart .bar2 .f { border-radius: 3px 3px 0 0; background: #dcd9e2; min-height: 4px; }
+    .chart .bar2 .f.today { background: linear-gradient(180deg, #f5842b, #e8385d); }
+    .chart-x { display: flex; gap: 3px; }
+    .chart-x div { flex: 1; text-align: center; font-weight: 500; font-size: 7.5px; color: var(--faint); }
+
+    /* ---- Log ---- */
+    .logbox { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; display: flex; flex-direction: column; gap: 6px; font: 400 11.5px/1.5 ui-monospace, Menlo, monospace; color: var(--muted); min-height: 40px; }
+    .logbox.recent { background: transparent; border: none; padding: 0; gap: 5px; font-size: 11px; }
+    .ln .tm { color: var(--faint); }
+    .ln .nm { color: var(--ink); font-weight: 600; }
+    .ln.empty { color: var(--faint); font-family: 'Instrument Sans', sans-serif; }
+
+    /* ---- Maintenance ---- */
+    .maint-desc { font-weight: 400; font-size: 11.5px; line-height: 1.5; color: var(--muted3); }
+    .maint-btns { display: flex; gap: 8px; }
+    .mbtn { flex: 1; text-align: center; border-radius: 9px; padding: 9px 0; font-weight: 700; font-size: 12px; cursor: pointer; }
+    .mbtn.recon { border: 1.5px solid #f5e0c8; background: #fdf7ef; color: #c07622; }
+    .mbtn.clean { border: 1.5px solid #f4d4dd; background: #fdf0f4; color: var(--rose); }
+    .mbtn.export { border: 1.5px solid var(--line); color: var(--muted); font-weight: 600; }
+    .mbtn:hover { filter: brightness(0.98); }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- ===== Header ===== -->
+    <div class="hdr">
+      <div class="hdr-top">
+        <div class="brand" id="brandHome">
+          <div class="brand-mark">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 5V2.5"/><circle cx="12" cy="2" r="0.6" fill="#fff" stroke="none"/>
+              <rect x="4.5" y="7" width="15" height="11" rx="3"/><path d="M2.5 11.5v3M21.5 11.5v3"/>
+              <circle cx="9" cy="12.5" r="1.3" fill="#fff" stroke="none"/><circle cx="15" cy="12.5" r="1.3" fill="#fff" stroke="none"/>
+            </svg>
+          </div>
+          <span class="brand-name">IG Auto</span>
+        </div>
+        <div class="brand back" id="brandBack" hidden>
+          <span class="chev">‹</span><span class="brand-name">Activity &amp; analytics</span>
+        </div>
+        <div class="hdr-right">
+          <span class="acct-chip"><span class="acct-dot" id="accountDot"></span><span id="accountLabel">no account</span></span>
+          <span class="hdr-ic" id="detectBtn" title="Use current page">⌖</span>
+        </div>
+      </div>
+
+      <!-- Home stat line -->
+      <div class="hdr-stats" id="hdrStats">
+        <span><b id="hFollowers">—</b> followers</span>
+        <span><b id="hBot">0</b> bot</span>
+        <span><b id="hUnfollowed">0</b> unfollowed</span>
+        <span class="ago" id="hAgo"></span>
+      </div>
+
+      <!-- Compose card (home + not running) -->
+      <div class="card" id="composeCard">
+        <div class="card-title">Who should I follow?</div>
+        <textarea id="runInput" class="inp" placeholder="Paste @handles, profile or post links…"></textarea>
+        <div class="chips" id="runChips"><span class="chips-empty">Handles, profile links or post links — mix them freely.</span></div>
+
+        <div class="hl">
+          <div class="hl-head">
+            <span class="hl-title">Human-likeness</span>
+            <span class="pace-pill" id="pacePill">Balanced</span>
+            <span class="spacer"></span>
+            <span class="adv-toggle" id="advToggle">Advanced <span class="arrow">›</span></span>
+          </div>
+          <input type="range" id="humanLevel" min="0" max="100" value="50">
+          <div class="scale"><span>FAST</span><span>STEALTH</span></div>
+          <div class="pace-desc" id="paceDesc"></div>
+        </div>
+
+        <div class="run-actions">
+          <div class="btn-dark" id="startBtn">Start following</div>
+          <div class="dry" id="dryToggle"><span class="box" id="dryMark"></span>Dry run</div>
+        </div>
+
+        <!-- Advanced -->
+        <div class="advanced" id="advPanel" hidden>
+          <div class="sec adv">TIMING<span class="line"></span><span class="link" id="advHide">hide advanced ▴</span></div>
+          <div class="frow">
+            <span class="flabel">Delay between actions (ms), min / max</span>
+            <div class="two"><input type="number" id="minDelay" class="inp"><input type="number" id="maxDelay" class="inp"></div>
+          </div>
+          <div class="frow">
+            <span class="flabel">Session cap — max follows per run</span>
+            <input type="number" id="sessionCap" class="inp">
+          </div>
+          <div class="frow">
+            <div style="display:flex;justify-content:space-between">
+              <span class="flabel">Randomization — human-like dwell &amp; scrolling</span>
+              <span style="font-weight:700;font-size:11px;color:var(--ink2)" id="randPct">40%</span>
+            </div>
+            <input type="range" id="randomization" min="0" max="100" step="5" value="40">
+          </div>
+
+          <div class="sec adv">HUMANIZATION<span class="line"></span></div>
+          <div>
+            <div class="trow"><div><div class="t-l">Browse posts first</div><div class="t-sub">Open post, scroll photos, dwell</div></div><div class="tgl" id="browsePosts"><div class="knob"></div></div></div>
+            <div class="trow"><div><div class="t-l">Like a comment sometimes</div><div class="t-sub">0–2, usually none</div></div><div class="tgl" id="likeComments"><div class="knob"></div></div></div>
+            <div class="trow"><div><div class="t-l">Like a post after following</div><div class="t-sub">For some of the people followed</div></div><div class="tgl" id="likeOnFollow"><div class="knob"></div></div></div>
+            <div class="trow"><div><div class="t-l">Prioritize keyword accounts</div><div class="t-sub">Always engage matching commenters</div></div><div class="tgl" id="flockPriority"><div class="knob"></div></div></div>
+          </div>
+          <div class="frow">
+            <span class="flabel">Keyword priority — always engage matching commenters</span>
+            <input type="text" id="flockKeyword" class="inp" placeholder="e.g. flock">
+          </div>
+
+          <div class="sec adv">LIMITS &amp; SCHEDULE<span class="line"></span></div>
+          <div class="trow"><div><div class="t-l">Only act during active hours</div><div class="t-sub">Sleeps outside the window · wraps midnight</div></div><div class="tgl" id="activeHoursEnabled"><div class="knob"></div></div></div>
+          <div class="two"><input type="number" id="activeStartHour" class="inp"><span class="to">to</span><input type="number" id="activeEndHour" class="inp"></div>
+          <div class="frow">
+            <span class="flabel">Daily follow budget — 0 = unlimited</span>
+            <input type="number" id="dailyBudget" class="inp">
+          </div>
+          <div class="trow"><div><div class="t-l">Fatigue mode</div><div class="t-sub">Bursts + breaks, slows over a session</div></div><div class="tgl" id="fatigueEnabled"><div class="knob"></div></div></div>
+
+          <div class="sec adv">FILTERS<span class="line"></span></div>
+          <div class="frow"><span class="flabel">Blacklist — never follow</span><textarea id="blacklist" class="inp" placeholder="usernames, comma or newline separated"></textarea></div>
+          <div class="frow"><span class="flabel">Protect — never unfollow</span><textarea id="protectList" class="inp" placeholder="usernames, comma or newline separated"></textarea></div>
+          <div>
+            <div class="trow"><div><div class="t-l">Skip verified accounts</div></div><div class="tgl" id="skipVerified"><div class="knob"></div></div></div>
+            <div class="trow"><div><div class="t-l">Skip private accounts</div></div><div class="tgl" id="skipPrivate"><div class="knob"></div></div></div>
+            <div class="trow"><div><div class="t-l">Vet every profile</div><div class="t-sub">Apply filters to everyone (slow)</div></div><div class="tgl" id="vetAllProfiles"><div class="knob"></div></div></div>
+          </div>
+          <div class="frow">
+            <span class="flabel">Follower range — skip accounts outside it · 0 disables</span>
+            <div class="two"><input type="number" id="minFollowers" class="inp" value="0"><span class="to">to</span><input type="number" id="maxFollowers" class="inp" value="0"></div>
+          </div>
+
+          <div class="sec adv">MAINTENANCE<span class="line"></span></div>
+          <div class="trow"><div><div class="t-l">Auto-reconcile follow-backs</div><div class="t-sub">Unfollows people who followed you back</div></div><div class="tgl" id="reconcileEnabled"><div class="knob"></div></div></div>
+          <div class="frow"><span class="flabel">Reconcile interval (min)</span><input type="number" id="reconcileInterval" class="inp"></div>
+          <div class="trow"><div><div class="t-l">Auto-cleanup non-followers</div><div class="t-sub">Unfollow after 3+ days of no follow-back</div></div><div class="tgl" id="cleanupEnabled"><div class="knob"></div></div></div>
+        </div>
+      </div>
+
+      <!-- Running card (home + running) -->
+      <div class="card" id="runningCard" hidden>
+        <div class="run-status">
+          <span class="dot" id="statusDot"></span>
+          <span class="txt" id="statusText">RUNNING</span>
+          <span class="next" id="nextIn"></span>
+        </div>
+        <div class="run-count"><span class="big" id="runCount">0</span><span class="sub" id="runCountSub"></span></div>
+        <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+        <div class="run-actions">
+          <div class="btn-dark" id="pauseBtn">❚❚ Pause</div>
+          <div class="btn-stop" id="stopBtn">◼ Stop</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Home body ===== -->
+    <div class="body" id="homeBody">
+      <!-- Running: queue + live log -->
+      <div id="runningBody" hidden style="display:flex;flex-direction:column;gap:12px;">
+        <div class="sec">QUEUE<span class="line"></span></div>
+        <div id="queueList" style="display:flex;flex-direction:column;gap:8px;"></div>
+        <div class="sec">LIVE<span class="line"></span><span class="link" id="goActivity1">full log ›</span></div>
+        <div class="logbox" id="liveLog"></div>
+        <div class="locked">Settings are locked while running · pause to edit</div>
+      </div>
+
+      <!-- Idle: activity summary -->
+      <div id="idleBody" style="display:flex;flex-direction:column;gap:12px;">
+        <div class="sec">ACTIVITY<span class="line"></span><span class="link" id="goActivity2">full view ›</span></div>
+        <div class="stat3">
+          <div class="mini"><div class="mini-v" id="miniBack">0</div><div class="mini-l">followed back</div></div>
+          <div class="mini"><div class="mini-v" id="miniDidnt">0</div><div class="mini-l">didn't yet</div></div>
+          <div class="mini"><div class="mini-v" id="miniToday">0</div><div class="mini-l">today</div></div>
+        </div>
+        <div class="sec">FOLLOWS PER DAY — LAST 14<span class="line"></span></div>
+        <div class="chart" id="chart"></div>
+        <div class="chart-x" id="chartX"></div>
+        <div class="sec">RECENT<span class="line"></span></div>
+        <div class="logbox recent" id="recentLog"></div>
+      </div>
+    </div>
+
+    <!-- ===== Activity view ===== -->
+    <div class="body" id="activityBody" hidden>
+      <div class="stat3 lg">
+        <div class="mini"><div class="mini-v" id="actToday">0</div><div class="mini-l">followed today</div></div>
+        <div class="mini"><div class="mini-v grad" id="actBack">0</div><div class="mini-l">followed back</div></div>
+        <div class="mini"><div class="mini-v" id="actUnfollowed">0</div><div class="mini-l">unfollowed</div></div>
+      </div>
+      <div class="sec">TODAY<span class="line"></span><span class="link" id="exportLog">export</span><span class="link" id="clearLog">clear</span></div>
+      <div class="logbox" id="fullLog"></div>
+      <div class="sec">MAINTENANCE<span class="line"></span></div>
+      <div class="card maint">
+        <div class="maint-desc">Reconcile unfollows people who followed back. Cleanup unfollows non-followers after 3 days.</div>
+        <div class="maint-btns">
+          <div class="mbtn recon" id="reconcileNow">Reconcile</div>
+          <div class="mbtn clean" id="cleanupNow">Cleanup</div>
+        </div>
+        <div class="mbtn export" id="exportTracked">Export tracked data</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
