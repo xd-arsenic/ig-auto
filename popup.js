@@ -409,11 +409,15 @@ function logLine(entry) {
   tm.className = "tm";
   tm.textContent = fmtTime(entry.t);
   const sym = document.createElement("span");
+  sym.className = "sym";
   sym.style.color = c;
-  sym.textContent = ` ${s} `;
+  sym.textContent = s;
+  const msg = document.createElement("span");
+  msg.className = "msg";
+  msg.textContent = entry.message || "";
   div.appendChild(tm);
   div.appendChild(sym);
-  div.appendChild(document.createTextNode(entry.message || ""));
+  div.appendChild(msg);
   return div;
 }
 

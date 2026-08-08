@@ -2,3 +2,6 @@
 Thumbs.db
 node_modules/
 *.log
+
+# Design source artifact, not part of the shipped extension
+IG Auto Prototype.html
