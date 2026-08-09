@@ -119,8 +119,40 @@
     };
   }
   
+  // The open followers/following dialog, if any. Instagram renders these lists
+  // as a modal (heading "Followers"/"Following") rather than a full page, so
+  // most list operations should be scoped to it. Pass `which` to require a
+  // specific one; omit it to match either.
+  // Headings for the three list modals we scope to. The likers modal is titled
+  // "Likes" — without it, listScope()/getScrollContainer() fall back to the
+  // whole document for post-likers jobs and can grab the wrong scroller or
+  // stray follow buttons.
+  const LIST_HEADINGS = new Set(["followers", "following", "likes"]);
+  function followDialogEl(which) {
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    for (const d of dialogs) {
+      const h = d.querySelector('[role="heading"], h1, h2');
+      const t = ((h && h.textContent) || "").trim().toLowerCase();
+      if (which) {
+        if (t === which) return d;
+      } else if (LIST_HEADINGS.has(t)) {
+        return d;
+      }
+    }
+    return null;
+  }
+
+  // Where list rows live: the open follow dialog if present, else the document.
+  function listScope() {
+    return followDialogEl() || document;
+  }
+
   function getScrollContainer() {
-    const divs = document.querySelectorAll("div");
+    // When a follow dialog is open, only look inside it — its inner list is the
+    // element that actually scrolls (and lazy-loads more rows).
+    const scope = followDialogEl();
+    const root = scope || document;
+    const divs = root.querySelectorAll("div");
     let best = null;
     let bestHeight = 0;
     
@@ -135,7 +167,7 @@
       }
     }
     
-    return best || document.scrollingElement;
+    return best || scope || document.scrollingElement;
   }
   
   // Resolve the element we actually scroll and whether it's the page/window.
@@ -198,7 +230,9 @@
   function readRows() {
     const rows = [];
     const seen = new Set();
-    const buttons = document.querySelectorAll('button, [role="button"]');
+    // Scope to the open follow dialog so we don't pick up the profile header's
+    // own Follow button (which would follow the account itself, not its list).
+    const buttons = listScope().querySelectorAll('button, [role="button"]');
     
     for (const btn of buttons) {
       const text = (btn.textContent || "").trim().toLowerCase();
@@ -225,7 +259,7 @@
   function findUserButton(username) {
     const target = String(username || "").toLowerCase();
     if (!target) return null;
-    const buttons = document.querySelectorAll('button, [role="button"]');
+    const buttons = listScope().querySelectorAll('button, [role="button"]');
     for (const btn of buttons) {
       const text = (btn.textContent || "").trim().toLowerCase();
       if (!FOLLOW_LABELS.has(text) && !FOLLOWING_LABELS.has(text)) continue;
@@ -337,6 +371,43 @@
     return { moved, atBottom: isAtBottom(), scrollTop: Math.round(scrollEl.scrollTop) };
   }
   
+  // Scroll the list so `username`'s row sits comfortably in view before we act
+  // on it — mirrors how a person scrolls down to the row they're about to
+  // follow. Reuses the human wheel/step motion of scroll(). Because the list is
+  // processed top-to-bottom this only ever needs to move downward. Returns
+  // { found }.
+  async function scrollToUser(args) {
+    const username = String((args && args.username) || "").toLowerCase();
+    if (!username) return { found: false };
+    if (!findUserButton(username)) return { found: false };
+    
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const btn = findUserButton(username);
+      if (!btn) return { found: false };
+      
+      const { usesWindow, scrollEl } = scrollTargetEls();
+      let viewTop, viewH;
+      if (usesWindow) {
+        viewTop = 0;
+        viewH = window.innerHeight;
+      } else {
+        const r = scrollEl.getBoundingClientRect();
+        viewTop = r.top;
+        viewH = r.height;
+      }
+      
+      const b = btn.getBoundingClientRect();
+      const rowCenter = b.top + b.height / 2;
+      // Aim a little above the middle of the list, with a touch of randomness.
+      const aim = viewTop + viewH * (0.4 + Math.random() * 0.2);
+      const delta = Math.round(rowCenter - aim);
+      if (Math.abs(delta) <= 36) return { found: true };
+      await scroll({ amount: delta });
+      await sleep(rand(120, 320));
+    }
+    return { found: true };
+  }
+  
   async function clickUnfollow() {
     const dialogs = document.querySelectorAll('[role="dialog"]');
     const confirm = dialogs[dialogs.length - 1];
@@ -369,16 +440,30 @@
     return null;
   }
   
-  // Comment/reply "like" heart buttons. Comment hearts are small (<=20px);
-  // the main post like button is 24px, so a height filter separates them.
+  function heartSvgs() {
+    return Array.from(
+      document.querySelectorAll('svg[aria-label="Like"], svg[aria-label="Unlike"]')
+    );
+  }
+  function svgHeight(svg) {
+    return parseInt((svg && svg.getAttribute("height")) || "0", 10) || 0;
+  }
+  function clickableFor(svg) {
+    return svg.closest('[role="button"]') || svg.closest("button") || svg.parentElement;
+  }
+
+  // Comment/reply "like" hearts. Rather than hardcoding pixel sizes (which
+  // breaks whenever IG tweaks the icon by a pixel), we classify by relative
+  // size: the single tallest heart on the page is the post's main action-bar
+  // like; every smaller heart is a comment/reply like.
   function commentLikeButtons() {
+    const svgs = heartSvgs();
+    if (svgs.length < 2) return []; // only the main heart (or none)
+    const maxH = Math.max(...svgs.map(svgHeight));
     const out = [];
-    const svgs = document.querySelectorAll('svg[aria-label="Like"], svg[aria-label="Unlike"]');
     for (const svg of svgs) {
-      const h = parseInt(svg.getAttribute("height") || "0", 10);
-      if (!h || h > 20) continue;
-      const btn =
-        svg.closest('[role="button"]') || svg.closest("button") || svg.parentElement;
+      if (svgHeight(svg) >= maxH) continue; // skip the (tallest) main heart
+      const btn = clickableFor(svg);
       if (btn) out.push(btn);
     }
     return out;
@@ -480,22 +565,18 @@
     return out;
   }
   
-  // Like the main post (action-bar) on a post/reel page. 24px heart = main like.
+  // Like the main post (action-bar) on a post/reel page. The main heart is the
+  // tallest Like/Unlike icon on the page (comment hearts are smaller), so we
+  // pick by relative size instead of a hardcoded pixel height.
   async function likePost() {
-    const svgs = document.querySelectorAll('svg[aria-label="Like"]');
-    for (const svg of svgs) {
-      const h = parseInt(svg.getAttribute("height") || "0", 10);
-      if (h >= 22) {
-        const btn =
-          svg.closest('[role="button"]') || svg.closest("button") || svg.parentElement;
-        const ok = await dispatchClickEl(btn);
-        return { liked: !!ok };
-      }
-    }
-    if (document.querySelector('svg[aria-label="Unlike"][height="24"]')) {
-      return { liked: false, already: true };
-    }
-    return { liked: false };
+    const svgs = heartSvgs();
+    if (!svgs.length) return { liked: false };
+    let main = svgs[0];
+    for (const svg of svgs) if (svgHeight(svg) > svgHeight(main)) main = svg;
+    // Already liked → the tallest heart is an "Unlike"; don't toggle it off.
+    if (main.getAttribute("aria-label") === "Unlike") return { liked: false, already: true };
+    const ok = await dispatchClickEl(clickableFor(main));
+    return { liked: !!ok };
   }
   
   // ---- Action-block detection ----------------------------------------------
@@ -585,6 +666,48 @@
     };
   }
 
+  // Find the clickable "N followers" / "N following" entry in a profile header.
+  // Modern Instagram makes these an <a href="#"> (or role=button) that opens a
+  // dialog, so we match on the visible "<count> followers|following" text and
+  // fall back to any legacy /followers/ or /following/ link.
+  function findCountEntry(which) {
+    const re = new RegExp(`^[\\d.,]+\\s*[kmb]?\\s*${which}$`, "i");
+    const scopes = [
+      document.querySelector("header"),
+      document.querySelector("main"),
+      document.body,
+    ];
+    for (const scope of scopes) {
+      if (!scope) continue;
+      const els = scope.querySelectorAll('a, [role="link"], [role="button"]');
+      for (const el of els) {
+        const t = ((el.textContent) || "").trim().toLowerCase();
+        if (re.test(t)) return el.closest('a, [role="link"], [role="button"]') || el;
+      }
+      const byHref = scope.querySelector(`a[href$="/${which}/"]`);
+      if (byHref) return byHref;
+    }
+    return null;
+  }
+
+  // Open the followers/following dialog for the profile we're on by clicking its
+  // header count, then wait for the modal to appear. `which` is
+  // "followers" | "following". Returns { opened, already?, error? }.
+  async function openFollowList(args) {
+    const which = args && args.which === "following" ? "following" : "followers";
+    if (followDialogEl(which)) return { opened: true, already: true };
+
+    const entry = findCountEntry(which);
+    if (!entry) return { opened: false, error: "count-not-found" };
+
+    await dispatchClickEl(entry);
+    for (let i = 0; i < 40; i++) {
+      if (followDialogEl(which)) return { opened: true };
+      await sleep(150);
+    }
+    return { opened: false, error: "dialog-timeout" };
+  }
+
   // Current follow state from a profile header: "following"/"requested"/"follow"/null.
   function getProfileFollowState() {
     const header = document.querySelector("header") || document.body;
@@ -610,6 +733,7 @@
     readRows,
     clickUser,
     scroll,
+    scrollToUser,
     clickUnfollow,
     getPostStats,
     getComments,
@@ -623,6 +747,7 @@
     getUserButtonLabel,
     getProfileFollowState,
     getProfileMeta,
+    openFollowList,
   };
   
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

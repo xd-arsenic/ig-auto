@@ -1,4 +1,10 @@
-importScripts("storage.js");
+// Chrome runs this as a service worker, where storage.js is pulled in with
+// importScripts. Firefox runs the background as an event page and can't use
+// importScripts, so there it's loaded ahead of us via background.scripts in the
+// manifest. Either way storage.js defines self.IGStore.
+if (typeof importScripts === "function") {
+  importScripts("storage.js");
+}
 
 const Store = self.IGStore;
 const RECONCILE_ALARM = "ig-reconcile";
@@ -80,6 +86,20 @@ async function findInstagramTab() {
   const tabs = await chrome.tabs.query({ url: "*://*.instagram.com/*" });
   if (!tabs || !tabs.length) return null;
   return tabs.find((t) => t.active) || tabs[0];
+}
+
+// Reads the logged-in account id straight from the ds_user_id cookie. This is a
+// robust fallback for when the content script can't report it (e.g. Firefox
+// messaging hiccups) and works even for HttpOnly cookies the page JS can't see.
+async function getAccountIdFromCookie() {
+  const urls = ["https://www.instagram.com/", "https://instagram.com/"];
+  for (const url of urls) {
+    try {
+      const c = await chrome.cookies.get({ url, name: "ds_user_id" });
+      if (c && c.value) return c.value;
+    } catch (_) {}
+  }
+  return null;
 }
 
 async function ensureContentScriptInjected(tabId) {
@@ -384,8 +404,10 @@ class JobRunner {
     for (const user of candidates) {
       if (this.shouldStop) return "stopped";
       if (!(await this.checkPaused())) return "stopped";
-      if (this.counters.acted >= effectiveCap) {
-        await this.log("warn", `Session cap reached (${effectiveCap})`);
+      // In dry-run only `preview` grows; in a live run only `acted` does — so
+      // the sum caps both against the same session limit.
+      if (this.counters.acted + this.counters.preview >= effectiveCap) {
+        await this.log("warn", `${this.job.dryRun ? "Preview" : "Session"} cap reached (${effectiveCap})`);
         return "cap";
       }
       if (this.handled.has(user)) continue;
@@ -441,7 +463,9 @@ class JobRunner {
         await this.humanDelay();
         await this.maybeFatigueBreak();
       } else {
-        await this.log("warn", `Couldn't follow @${user}`);
+        // Clicked but unconfirmed — pace anyway so misses don't rapid-fire.
+        await this.log("warn", `Couldn't confirm follow of @${user} — pacing before next`);
+        await this.humanDelay();
       }
     }
     return "done";
@@ -540,13 +564,12 @@ class JobRunner {
 
   async runUnfollowNonFollowers() {
     const me = this.job.username;
-    const desired = `/${me}/following/`;
-    
-    let url = await sendCommand(this.tabId, "getUrl");
-    if (!url || !url.includes(desired)) {
-      await this.log("info", "Navigating to your following list");
-      await chrome.tabs.update(this.tabId, { url: `https://instagram.com${desired}` });
-      await this.waitForNavigation(desired);
+
+    await this.log("info", "Opening your following list");
+    const opened = await this.openList(me, "following");
+    if (!opened) {
+      await this.log("warn", "Couldn't open your following list");
+      return;
     }
     
     if (!(await this.checkPaused())) return;
@@ -582,9 +605,14 @@ class JobRunner {
         return "preview";
       }
       
-      await sendCommand(this.tabId, "clickUser", { username: row.username });
-      await sleep(rand(500, 1000));
-      await sendCommand(this.tabId, "clickUnfollow");
+      await this.scrollUserIntoView(row.username);
+      const res = await this.unfollowRow(row.username, () => this.openList(me, "following"));
+      if (res === "stopped") return "skip";
+      if (res !== "ok") {
+        await this.log("warn", `Couldn't confirm unfollow of @${row.username} — leaving tracked`);
+        await this.humanDelay();
+        return "skip";
+      }
       await Store.markUnfollowed(this.job.accountId, row.username, "no-follow-back");
       await this.log("info", `Unfollowed @${row.username} (no follow-back after 3 days)`);
       return "acted";
@@ -619,6 +647,43 @@ class JobRunner {
   // at R=0 it's the raw base delay, at R=1 up to ~3x longer.
   scaled(min, max, R) {
     return Math.round(rand(min, max) * (1 + R * 2));
+  }
+
+  // Open a profile's followers/following list. Instagram renders these as a
+  // modal that only appears when the header count is clicked — a direct
+  // /followers/ URL just shows the profile with no list — so we load the
+  // profile and click the count, then fall back to the legacy URL if needed.
+  // Returns true once the dialog is open. `which` is "followers" | "following".
+  async openList(username, which) {
+    const profilePath = `/${username}/`;
+
+    // Land on the profile page if we're not already there (and not sitting on a
+    // stale list/post URL from a previous target).
+    const cur = await sendCommand(this.tabId, "getUrl");
+    const onProfile =
+      cur &&
+      cur.includes(profilePath) &&
+      !cur.includes("/followers/") &&
+      !cur.includes("/following/") &&
+      !cur.includes("/p/");
+    if (!onProfile) {
+      await chrome.tabs.update(this.tabId, { url: `https://instagram.com${profilePath}` });
+      await this.waitForNavigation(profilePath);
+      await sleep(rand(900, 1800));
+    }
+
+    let res = await sendCommand(this.tabId, "openFollowList", { which });
+    if (res && res.opened) return true;
+
+    // Fallback: some builds still open the modal from the direct URL.
+    await this.log("info", `Opening ${which} via direct URL (header count not found)…`);
+    await chrome.tabs.update(this.tabId, {
+      url: `https://instagram.com${profilePath}${which}/`,
+    });
+    await this.waitForNavigation(`/${which}/`);
+    await sleep(rand(900, 1800));
+    res = await sendCommand(this.tabId, "openFollowList", { which });
+    return !!(res && res.opened);
   }
 
   // Decide how many comments to like given the post's like count and how many
@@ -752,7 +817,7 @@ class JobRunner {
         if (visits >= maxVisits) break;
         if (this.shouldStop) return;
         if (!(await this.checkPaused())) return;
-        if (this.counters.acted >= effectiveCap) break;
+        if (this.counters.acted + this.counters.preview >= effectiveCap) break;
         if (this.handled.has(user)) continue;
         if (Math.random() > 0.2 + 0.75 * R) continue;
         visits++;
@@ -802,6 +867,11 @@ class JobRunner {
     }
 
     if (this.job.dryRun) {
+      // Count keyword-account follows toward the preview + cap, like every other
+      // dry-run follow, so the previewed total is honest.
+      this.handled.add(username);
+      this.counters.preview++;
+      await this.updateJob({ progress: { preview: this.counters.preview, lastUser: username } });
       await this.log("info", `[dry-run] Would follow @${username}`);
     } else {
       const pre = await sendCommand(this.tabId, "getProfileFollowState");
@@ -912,10 +982,19 @@ class JobRunner {
         if (!(await this.checkPaused())) return;
       }
       
-      const url = await sendCommand(this.tabId, "getUrl");
-      if (!url || !url.includes(desired)) {
-        await chrome.tabs.update(this.tabId, { url: `https://instagram.com${desired}` });
-        await this.waitForNavigation(desired);
+      if (kind === "followers") {
+        const opened = await this.openList(target, "followers");
+        if (!opened) {
+          await this.log("warn", `Couldn't open @${target}'s followers list — skipping`);
+          await this.updateJob({ progress: { queueCursor: i + 1 } });
+          continue;
+        }
+      } else {
+        const url = await sendCommand(this.tabId, "getUrl");
+        if (!url || !url.includes(desired)) {
+          await chrome.tabs.update(this.tabId, { url: `https://instagram.com${desired}` });
+          await this.waitForNavigation(desired);
+        }
       }
       
       if (!(await this.checkPaused())) return;
@@ -962,10 +1041,15 @@ class JobRunner {
           }
           // Respect active-hours + daily budget before each follow.
           if ((await this.gateBeforeFollow()) === "stopped") return "skip";
+          // Scroll the row into view so the follow happens where we're looking.
+          await this.scrollUserIntoView(row.username);
           const res = await this.followWithBackoff({
             doClick: () => sendCommand(this.tabId, "clickUser", { username: row.username }),
             verify: () => this.verifyListFollow(row.username),
-            reloadUrl: this.currentListUrl,
+            // Followers live in a modal, so after a backoff cool-down we must
+            // reopen it rather than just reloading a URL.
+            reloadUrl: kind === "likers" ? this.currentListUrl : null,
+            reopen: kind === "followers" ? () => this.openList(target, "followers") : null,
           });
           if (res === "stopped") return "skip";
           if (res === "ok") {
@@ -979,7 +1063,11 @@ class JobRunner {
             await this.log("info", `Followed @${row.username}`);
             return "acted";
           }
-          await this.log("warn", `Couldn't follow @${row.username} (skipped)`);
+          // We clicked but couldn't confirm it. Still pace like a human before
+          // the next attempt so a string of misses can't turn into rapid-fire
+          // clicking (which both looks robotic and trips action blocks).
+          await this.log("warn", `Couldn't confirm follow of @${row.username} — pacing before next`);
+          await this.humanDelay();
           return "skip";
         }
         return "skip";
@@ -1016,13 +1104,12 @@ class JobRunner {
 
   async runReconcile() {
     const me = this.job.username;
-    const desired = `/${me}/followers/`;
-    
-    let url = await sendCommand(this.tabId, "getUrl");
-    if (!url || !url.includes(desired)) {
-      await this.log("info", "Navigating to your followers");
-      await chrome.tabs.update(this.tabId, { url: `https://instagram.com${desired}` });
-      await this.waitForNavigation(desired);
+
+    await this.log("info", "Opening your followers");
+    const opened = await this.openList(me, "followers");
+    if (!opened) {
+      await this.log("warn", "Couldn't open your followers list");
+      return;
     }
     
     if (!(await this.checkPaused())) return;
@@ -1045,9 +1132,14 @@ class JobRunner {
         return "preview";
       }
       
-      await sendCommand(this.tabId, "clickUser", { username: row.username });
-      await sleep(rand(500, 1000));
-      await sendCommand(this.tabId, "clickUnfollow");
+      await this.scrollUserIntoView(row.username);
+      const res = await this.unfollowRow(row.username, () => this.openList(me, "followers"));
+      if (res === "stopped") return "skip";
+      if (res !== "ok") {
+        await this.log("warn", `Couldn't confirm unfollow of @${row.username} — leaving tracked`);
+        await this.humanDelay();
+        return "skip";
+      }
       await Store.markUnfollowed(this.job.accountId, row.username, "followed-back");
       await this.log("info", `Unfollowed @${row.username} (followed back)`);
       return "acted";
@@ -1059,6 +1151,12 @@ class JobRunner {
   // ("cap" or "stopped").
   async processList(onRow) {
     let stableBottom = 0;
+    // Snapshot the (jittered) cap once per run so the stopping threshold is
+    // stable — recomputing it per row makes the stop point wobble. In a live
+    // run only `acted` grows; in a dry run only `preview` does, so both are
+    // measured against this same limit.
+    const settings = await Store.getSettings();
+    const effectiveCap = (Number(settings.sessionCap) || 100) + rand(-2, 3);
     
     while (!this.shouldStop) {
       if (!(await this.checkPaused())) return "stopped";
@@ -1086,9 +1184,6 @@ class JobRunner {
               retries: 0,
             },
           });
-          const settings = await Store.getSettings();
-          const effectiveCap = settings.sessionCap + rand(-2, 3);
-          
           if (this.counters.acted >= effectiveCap) {
             await this.log("warn", `Session cap reached (${effectiveCap})`);
             return "cap";
@@ -1100,6 +1195,11 @@ class JobRunner {
           await this.updateJob({
             progress: { preview: this.counters.preview, lastUser: row.username },
           });
+          // Dry runs preview only as far as a real run would go.
+          if (this.counters.preview >= effectiveCap) {
+            await this.log("warn", `Preview cap reached (${effectiveCap})`);
+            return "cap";
+          }
         }
       }
       
@@ -1114,6 +1214,20 @@ class JobRunner {
       await this.humanScroll();
     }
     return "stopped";
+  }
+
+  // Bring a row into view before acting on it, so the follow/unfollow happens
+  // at the row we're actually looking at — never while the list has drifted
+  // somewhere else. Best-effort; a virtualized-away row just no-ops.
+  async scrollUserIntoView(username) {
+    try {
+      await sendCommand(this.tabId, "scrollToUser", { username });
+    } catch (_) {}
+    // Dwell on the row before acting; the pause grows with the human-likeness
+    // level so the scroll → look → follow rhythm slows down at higher stealth.
+    const s = await Store.getSettings();
+    const R = Math.max(0, Math.min(1, (Number(s.randomization) || 0) / 100));
+    await sleep(this.scaled(180, 460, R));
   }
 
   async humanScroll() {
@@ -1207,10 +1321,26 @@ class JobRunner {
   //   verify    → returns "ok" | "blocked" | "failed"
   //   reloadUrl → path to reload before each retry (keeps the button fresh)
   // Returns "ok" | "failed" | "stopped".
-  async followWithBackoff({ doClick, verify, reloadUrl }) {
+  async followWithBackoff({ doClick, verify, reloadUrl, reopen, actionName = "Follow" }) {
+    const verb = actionName.toLowerCase() + "s"; // "follows" / "unfollows"
+    // Poll the verification a few times before concluding it failed. The
+    // Follow button (especially in the likers/followers modal) can take a
+    // second or two to flip to "Following", and the row may re-render — a
+    // single check misreads those genuine follows as failures, which both
+    // loses the tracked follow AND skips the human pacing delay (making the
+    // run fire clicks back-to-back).
+    const confirm = async () => {
+      for (let i = 0; i < 6; i++) {
+        const st = await verify();
+        if (st === "ok" || st === "blocked") return st;
+        await sleep(rand(400, 750));
+      }
+      return "failed";
+    };
+
     await doClick();
-    await sleep(rand(700, 1300));
-    let state = await verify();
+    await sleep(rand(600, 1100));
+    let state = await confirm();
 
     while (state === "blocked") {
       if (this.shouldStop) return "stopped";
@@ -1218,7 +1348,7 @@ class JobRunner {
       const waitMs = this.backoffDuration(this.consecutiveBlocks);
       await this.log(
         "warn",
-        `Instagram action block detected — pausing follows for ${this.fmtDur(waitMs)} (block #${this.consecutiveBlocks}), then retrying.`
+        `Instagram action block detected — pausing ${verb} for ${this.fmtDur(waitMs)} (block #${this.consecutiveBlocks}), then retrying.`
       );
       try {
         await sendCommand(this.tabId, "dismissDialog");
@@ -1227,7 +1357,12 @@ class JobRunner {
       const ok = await this.interruptibleWait(waitMs, `action block #${this.consecutiveBlocks}`);
       if (!ok) return "stopped";
 
-      if (reloadUrl) {
+      if (reopen) {
+        try {
+          await reopen();
+          await sleep(rand(800, 1600));
+        } catch (_) {}
+      } else if (reloadUrl) {
         try {
           await chrome.tabs.update(this.tabId, { url: `https://instagram.com${reloadUrl}` });
           await this.waitForNavigation(reloadUrl);
@@ -1236,19 +1371,47 @@ class JobRunner {
       }
 
       await doClick();
-      await sleep(rand(700, 1300));
-      state = await verify();
+      await sleep(rand(600, 1100));
+      state = await confirm();
     }
 
     if (state === "ok") {
       if (this.consecutiveBlocks > 0) {
-        await this.log("info", "Follow succeeded — action block appears lifted.");
+        await this.log("info", `${actionName} succeeded — action block appears lifted.`);
         this.consecutiveBlocks = 0;
         await this.updateJob({ progress: { backoffLevel: 0 } });
       }
       return "ok";
     }
     return "failed";
+  }
+
+  // Confirm an unfollow: the row's button must have flipped back to Follow, or
+  // the user dropped out of the list entirely (only possible on our own
+  // *following* list). An action-block notice takes precedence so we never mark
+  // someone unfollowed while still following them.
+  async verifyUnfollow(username) {
+    const b = await sendCommand(this.tabId, "detectActionBlock");
+    if (b && b.blocked) return "blocked";
+    const label = await sendCommand(this.tabId, "getUserButtonLabel", { username });
+    if (label === "following" || label === "requested") return "failed";
+    return "ok"; // "follow"/"follow back" or gone from the list
+  }
+
+  // Perform one verified, block-aware unfollow of a list row. Reopens the given
+  // list on backoff (unfollows happen inside the followers/following modal).
+  // Returns "ok" | "failed" | "stopped".
+  async unfollowRow(username, reopen) {
+    return this.followWithBackoff({
+      actionName: "Unfollow",
+      doClick: async () => {
+        await sendCommand(this.tabId, "clickUser", { username });
+        await sleep(rand(500, 1000));
+        await sendCommand(this.tabId, "clickUnfollow");
+      },
+      verify: () => this.verifyUnfollow(username),
+      reopen,
+    });
   }
 
   // Confirm a list follow by re-reading the row's button; distinguish a genuine
@@ -1382,7 +1545,6 @@ async function resumeJobIfNeeded() {
     if (!fresh || fresh.id !== job.id || TERMINAL_STATUSES.has(fresh.status)) return;
     if (fresh.status === "paused") return;
     await appendLog("info", "Resuming interrupted job after restart…");
-    activeTabId = tab.id;
     activeRunner = new JobRunner(fresh, tab.id);
     activeRunner.run();
   } finally {
@@ -1392,7 +1554,10 @@ async function resumeJobIfNeeded() {
 
 // ---- State Management -----------------------------------------------------
 let activeRunner = null;
-let activeTabId = null;
+// Guards the startJob handler: its setup is async (tab lookup, injection,
+// account detection), so two quick clicks could otherwise interleave and spin
+// up two runners driving the same tab at once.
+let starting = false;
 
 async function getJob() {
   const { job } = await chrome.storage.local.get("job");
@@ -1423,49 +1588,57 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
         
       case "startJob": {
-        if (activeRunner) {
-          activeRunner.stop();
-          activeRunner = null;
-        }
-        
-        const tab = await findInstagramTab();
-        if (!tab) {
-          sendResponse({ ok: false, error: "no-tab" });
+        if (starting) {
+          sendResponse({ ok: false, error: "busy" });
           return;
         }
-        
-        const injected = await ensureContentScriptInjected(tab.id);
-        if (!injected) {
-          sendResponse({ ok: false, error: "injection-failed" });
-          return;
+        starting = true;
+        try {
+          if (activeRunner) {
+            activeRunner.stop();
+            activeRunner = null;
+          }
+          
+          const tab = await findInstagramTab();
+          if (!tab) {
+            sendResponse({ ok: false, error: "no-tab" });
+            return;
+          }
+          
+          const injected = await ensureContentScriptInjected(tab.id);
+          if (!injected) {
+            sendResponse({ ok: false, error: "injection-failed" });
+            return;
+          }
+          
+          const accountInfo = await sendCommand(tab.id, "getAccountInfo");
+          if (!accountInfo || !accountInfo.accountId) {
+            sendResponse({ ok: false, error: "no-account" });
+            return;
+          }
+          
+          const settings = await Store.getSettings();
+          const job = {
+            id: `${Date.now()}`,
+            type: msg.job.type,
+            param: msg.job.param || {},
+            status: "running",
+            progress: { followed: 0, unfollowed: 0, preview: 0 },
+            startedAt: Date.now(),
+            accountId: accountInfo.accountId,
+            username: accountInfo.username,
+            dryRun: settings.dryRun,
+          };
+          
+          await saveJob(job);
+          
+          activeRunner = new JobRunner(job, tab.id);
+          activeRunner.run();
+          
+          sendResponse({ ok: true, job });
+        } finally {
+          starting = false;
         }
-        
-        const accountInfo = await sendCommand(tab.id, "getAccountInfo");
-        if (!accountInfo || !accountInfo.accountId) {
-          sendResponse({ ok: false, error: "no-account" });
-          return;
-        }
-        
-        const settings = await Store.getSettings();
-        const job = {
-          id: `${Date.now()}`,
-          type: msg.job.type,
-          param: msg.job.param || {},
-          status: "running",
-          progress: { followed: 0, unfollowed: 0, preview: 0 },
-          startedAt: Date.now(),
-          accountId: accountInfo.accountId,
-          username: accountInfo.username,
-          dryRun: settings.dryRun,
-        };
-        
-        await saveJob(job);
-        
-        activeTabId = tab.id;
-        activeRunner = new JobRunner(job, tab.id);
-        activeRunner.run();
-        
-        sendResponse({ ok: true, job });
         break;
       }
       
@@ -1495,7 +1668,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             const tab = await findInstagramTab();
             if (tab && (await ensureContentScriptInjected(tab.id))) {
               await saveJob({ ...job, status: "running" });
-              activeTabId = tab.id;
               activeRunner = new JobRunner({ ...job, status: "running" }, tab.id);
               activeRunner.run();
             }
@@ -1510,7 +1682,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           activeRunner.stop();
           activeRunner = null;
         }
-        activeTabId = null;
         const job = await getJob();
         if (job) await saveJob({ ...job, status: "stopped" });
         sendResponse({ ok: true });
@@ -1525,23 +1696,31 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         
       case "getAccountInfo": {
         const tab = await findInstagramTab();
-        if (!tab) {
-          sendResponse({ ok: false, error: "no-tab" });
-          break;
-        }
-        const injected = await ensureContentScriptInjected(tab.id);
-        if (!injected) {
-          sendResponse({ ok: false, error: "injection-failed" });
-          break;
-        }
-        try {
-          const account = await sendCommand(tab.id, "getAccountInfo");
-          if (account?.accountId) {
-            await Store.ensureAccount(account.accountId, account.username);
+        let account = null;
+        // Preferred path: ask the content script (gets the @username too).
+        if (tab) {
+          const injected = await ensureContentScriptInjected(tab.id);
+          if (injected) {
+            try { account = await sendCommand(tab.id, "getAccountInfo"); } catch (_) {}
           }
+        }
+        // Fallback: read the login cookie directly. Fixes "no account" when the
+        // content script is unreachable (notably on Firefox).
+        if (!account || !account.accountId) {
+          const cookieId = await getAccountIdFromCookie();
+          if (cookieId) {
+            const existing = await Store.getAccount(cookieId);
+            account = {
+              accountId: cookieId,
+              username: (account && account.username) || existing?.username || null,
+            };
+          }
+        }
+        if (account?.accountId) {
+          await Store.ensureAccount(account.accountId, account.username);
           sendResponse({ ok: true, account });
-        } catch (e) {
-          sendResponse({ ok: false, error: e.message });
+        } else {
+          sendResponse({ ok: false, error: tab ? "no-account" : "no-tab" });
         }
         break;
       }
@@ -1587,6 +1766,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse(res);
         break;
       }
+
+      case "getDisplayMode": {
+        sendResponse({ ok: true, mode: await getStoredDisplayMode() });
+        break;
+      }
+
+      case "setDisplayMode": {
+        const mode = await applyDisplayMode(msg.mode);
+        try {
+          await chrome.storage.local.set({ displayMode: mode });
+        } catch (_) {}
+        sendResponse({ ok: true, mode });
+        break;
+      }
+
+      case "openActionPopup": {
+        // Called right after the side panel closes itself. We open the popup
+        // here (not in the panel) so the panel's teardown can't steal focus and
+        // instantly dismiss the popup. openPopup() needs no user gesture in
+        // Chrome, but it rejects if the window isn't focused. We wait for the
+        // panel to finish closing, re-focus the window, then open once.
+        const windowId = msg.windowId;
+        // Reply immediately so the panel's await resolves and it can close.
+        sendResponse({ ok: true });
+        openActionPopupSoon(windowId);
+        break;
+      }
         
       default:
         sendResponse({ ok: false, error: "unknown-action" });
@@ -1627,7 +1833,6 @@ async function triggerReconcile() {
     };
     
     await saveJob(job);
-    activeTabId = tab.id;
     activeRunner = new JobRunner(job, tab.id);
     activeRunner.run();
     
@@ -1675,7 +1880,6 @@ async function triggerCleanup() {
     };
     
     await saveJob(job);
-    activeTabId = tab.id;
     activeRunner = new JobRunner(job, tab.id);
     activeRunner.run();
     
@@ -1718,29 +1922,110 @@ chrome.cookies.onChanged.addListener(async (info) => {
   await Store.ensureAccount(info.cookie.value, null);
 });
 
-// Open the docked side panel (full-height, right side) when the toolbar icon is
-// clicked, instead of the small transient popup. Safe no-op on older Chrome.
-async function enableSidePanel() {
+// The UI can live either as a full-height docked side panel or as the classic
+// transient toolbar popup. Both surfaces render popup.html; we just flip which
+// one the toolbar icon opens. Persisted in storage so it survives restarts.
+async function applyDisplayMode(mode) {
+  const m = mode === "popup" ? "popup" : "sidepanel";
+  // Firefox has no chrome.sidePanel and doesn't rebind the toolbar icon; the
+  // sidebar/popup switch happens directly in the UI via sidebarAction there.
+  if (!chrome.sidePanel || !chrome.action || !chrome.action.setPopup) return m;
   try {
-    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+    if (m === "popup") {
+      // Icon click opens the standard anchored popup (Chrome docks it under the
+      // toolbar icon with native rounded corners + spacing). The ctx flag lets
+      // popup.html pin a fixed width; the side panel loads the plain path.
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+      await chrome.action.setPopup({ popup: "popup.html?ctx=popup" });
+    } else {
+      await chrome.action.setPopup({ popup: "" });
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+    }
   } catch (_) {}
+  return m;
+}
+
+// Opens the toolbar action popup once the side panel has finished closing. The
+// delay matters: opening too early (while the panel is still tearing down)
+// dismisses the popup as focus shifts back to the page. openPopup() also rejects
+// unless the target window is focused, so we assert focus first.
+async function openActionPopupSoon(windowId) {
+  // Firefox: close the sidebar first (openPopup rejects while a panel is open),
+  // then open the popup. Done from the background because the sidebar page can't
+  // close itself and still open the popup afterwards.
+  if (typeof browser !== "undefined" && browser.sidebarAction) {
+    try { await browser.sidebarAction.close(); } catch (_) {}
+    try { await browser.action.openPopup(); } catch (e) {
+      console.warn("[IG Auto] openPopup (firefox) failed:", e && e.message);
+    }
+    return;
+  }
+  if (!chrome.action || !chrome.action.openPopup) return;
+  await sleep(300);
+  try {
+    if (windowId != null) {
+      try { await chrome.windows.update(windowId, { focused: true }); } catch (_) {}
+      await chrome.action.openPopup({ windowId });
+    } else {
+      await chrome.action.openPopup();
+    }
+  } catch (e) {
+    console.warn("[IG Auto] openActionPopup failed:", e && e.message);
+  }
+}
+
+async function getStoredDisplayMode() {
+  try {
+    const { displayMode } = await chrome.storage.local.get("displayMode");
+    return displayMode === "popup" ? "popup" : "sidepanel";
+  } catch (_) {
+    return "sidepanel";
+  }
+}
+
+// The UI defaults to the docked side panel on first install, and re-defaults to
+// it periodically (every DISPLAY_MODE_RESET_MS) so the side panel stays the
+// primary surface even if the user occasionally pops out to a window.
+const DISPLAY_MODE_RESET_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function resolveDisplayModeWithReset() {
+  try {
+    const { displayMode, displayModeResetAt } = await chrome.storage.local.get([
+      "displayMode",
+      "displayModeResetAt",
+    ]);
+    const now = Date.now();
+    const firstRun = !displayModeResetAt;
+    const dueForReset = displayModeResetAt && now - displayModeResetAt >= DISPLAY_MODE_RESET_MS;
+    if (firstRun || dueForReset || displayMode == null) {
+      await chrome.storage.local.set({ displayMode: "sidepanel", displayModeResetAt: now });
+      return "sidepanel";
+    }
+    return displayMode === "popup" ? "popup" : "sidepanel";
+  } catch (_) {
+    return "sidepanel";
+  }
+}
+
+async function initDisplayMode() {
+  await applyDisplayMode(await resolveDisplayModeWithReset());
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  enableSidePanel();
+  initDisplayMode();
   scheduleReconcile();
   scheduleCleanup();
   resumeJobIfNeeded();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  enableSidePanel();
+  initDisplayMode();
   scheduleReconcile();
   scheduleCleanup();
   resumeJobIfNeeded();
 });
 
-enableSidePanel();
+initDisplayMode();
 
 // The heartbeat alarm persists across service-worker restarts, so if the worker
 // is torn down mid-job it will be woken within ~30s and resume via onAlarm.

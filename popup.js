@@ -9,53 +9,32 @@ let lastJob = null;
 const RUNNING_STATES = new Set(["running", "waiting", "paused"]);
 
 // ---- Messaging -----------------------------------------------------------
-async function sendToBackground(action, payload = {}) {
+// A single stalled round-trip (e.g. messaging the content script while the
+// running job is mid-navigation) must never freeze the popup's render loop, so
+// every call is raced against a timeout and resolves to null on miss.
+async function sendToBackground(action, payload = {}, timeoutMs = 4000) {
   try {
-    return await chrome.runtime.sendMessage({ action, ...payload });
+    return await Promise.race([
+      chrome.runtime.sendMessage({ action, ...payload }),
+      new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
   } catch (e) {
     return null;
   }
 }
 
 // ---- Settings ------------------------------------------------------------
-const DEFAULT_SETTINGS = {
-  humanLevel: 50,
-  minDelayMs: 3000,
-  maxDelayMs: 8000,
-  sessionCap: 100,
-  reconcileEnabled: true,
-  reconcileIntervalMin: 15,
-  cleanupEnabled: true,
-  dryRun: false,
-  browsePosts: false,
-  likeComments: false,
-  randomization: 40,
-  flockPriority: false,
-  flockKeyword: "flock",
-  likeOnFollow: false,
-  activeHoursEnabled: false,
-  activeStartHour: 8,
-  activeEndHour: 23,
-  dailyBudget: 180,
-  fatigueEnabled: false,
-  blacklist: "",
-  protectList: "",
-  skipVerified: false,
-  skipPrivate: false,
-  minFollowers: 0,
-  maxFollowers: 0,
-  vetAllProfiles: false,
-};
+// storage.js (loaded first) owns the canonical DEFAULT_SETTINGS and the
+// write-locked read-modify-write mutators; the popup goes through them so the
+// defaults never drift and rapid toggles can't clobber each other.
+const Store = self.IGStore;
 
 async function getSettings() {
-  const { settings } = await chrome.storage.local.get("settings");
-  return Object.assign({}, DEFAULT_SETTINGS, settings || {});
+  return Store.getSettings();
 }
 
 async function patchSettings(partial) {
-  const s = Object.assign(await getSettings(), partial);
-  await chrome.storage.local.set({ settings: s });
-  return s;
+  return Store.setSettings(partial);
 }
 
 // ---- Toggle helpers (styled div switches) --------------------------------
@@ -153,6 +132,25 @@ function presetFromLevel(level) {
   };
 }
 
+// Effective throttle for a given human-likeness level. Mirrors the engine's
+// two real constraints so the label is honest: (1) a randomized gap between
+// follows (min/maxDelay), and (2) a rolling hourly cap that tightens with the
+// level (~15–20/hr at max). The sustained rate is whichever is stricter.
+function paceMetrics(level) {
+  const H = Math.max(0, Math.min(100, Number(level) || 0));
+  const R = H / 100;
+  const minMs = Math.round(2000 + H * 80); // matches presetFromLevel
+  const maxMs = Math.round(5000 + H * 180);
+  const avgSec = (minMs + maxMs) / 2000;
+  const delayPerHr = 3600 / avgSec;
+  // Same shape as JobRunner.hourlyCap with the 15–20 midpoint (~17).
+  const hourlyMax = 17;
+  const cap = R >= 1 ? hourlyMax : Math.max(hourlyMax, Math.round(hourlyMax / (0.35 + 0.65 * R)));
+  const perHr = Math.round(Math.min(delayPerHr, cap));
+  const cappedByHour = cap < delayPerHr;
+  return { minMs, maxMs, perHr, cappedByHour };
+}
+
 // Colour + label for a given human-likeness level, matching the prototype's
 // orange → rose → magenta interpolation.
 function paceStyle(level) {
@@ -165,13 +163,16 @@ function paceStyle(level) {
   const rgb = stops[i0].map((c, j) => Math.round(c + (stops[i0 + 1][j] - c) * f));
   const color = `rgb(${rgb.join(",")})`;
   const bg = `rgba(${rgb.join(",")},.12)`;
-  const rate = Math.round(60 - H * 0.45); // ~60/hr → ~15/hr
+
+  const m = paceMetrics(H);
+  const gap = `${Math.round(m.minMs / 1000)}–${Math.round(m.maxMs / 1000)}s between follows`;
+  const rate = m.cappedByHour ? `~${m.perHr}/hr (hourly cap)` : `~${m.perHr}/hr`;
   const desc =
     label === "Stealth"
-      ? `~${rate}/hr · browses & likes like a person · waking hours`
+      ? `${rate} · ${gap} · browses & likes · waking hours`
       : label === "Balanced"
-      ? `~${rate}/hr · some browsing & likes · short breaks`
-      : `~${rate}/hr · minimal dwell · highest detection risk`;
+      ? `${rate} · ${gap} · some browsing · short breaks`
+      : `${rate} · ${gap} · minimal dwell · highest detection risk`;
   return { label, color, bg, desc };
 }
 
@@ -572,10 +573,23 @@ function updateNextIn(job) {
   }
 }
 
+// Normalize a job's targets into { kind, value } items for the queue view.
+// The unified "follow" job carries param.items; the legacy followFollowers /
+// followLikers jobs carry a bare param.targets array, so map those by type.
+function queueItems(job) {
+  const p = (job && job.param) || {};
+  if (Array.isArray(p.items)) return p.items;
+  if (Array.isArray(p.targets)) {
+    const kind = job && job.type === "followLikers" ? "likers" : "followers";
+    return p.targets.map((value) => ({ kind, value }));
+  }
+  return [];
+}
+
 function renderQueue(job) {
   const box = $("queueList");
   box.innerHTML = "";
-  const items = (job && job.param && Array.isArray(job.param.items) && job.param.items) || [];
+  const items = queueItems(job);
   const p = (job && job.progress) || {};
 
   if (!items.length) {
@@ -646,35 +660,47 @@ function renderChrome(job) {
 async function refreshState() {
   const res = await sendToBackground("getState");
   lastJob = res && res.ok ? res.job : null;
-  await renderAccountInfo(lastJob);
-  await sendToBackground("getProfileStats"); // ask content to refresh profile
+  const running = RUNNING_STATES.has((lastJob && lastJob.status) || "idle");
+
+  // Everything below reads from storage only, so the running-card counter keeps
+  // ticking from the persisted job progress even while the job is busy driving
+  // the tab. We must NOT block this loop on content-script round-trips.
+  await renderAccountInfo(lastJob, running);
   const st = await renderStatsUI();
   renderChrome(lastJob);
-  if (RUNNING_STATES.has((lastJob && lastJob.status) || "idle")) {
-    await renderRunningCard(lastJob, st);
-  }
+  if (running) await renderRunningCard(lastJob, st);
   await renderLogs();
+
+  // The Instagram tab belongs to the job while it runs; only ask the content
+  // script for fresh profile counts when idle, and never await it here.
+  if (!running) sendToBackground("getProfileStats");
 }
 
-async function renderAccountInfo(job) {
-  const acc = await sendToBackground("getAccountInfo");
+async function renderAccountInfo(job, running) {
   let username = null, accountId = null;
-  if (acc && acc.ok && acc.account?.accountId) {
-    username = acc.account.username;
-    accountId = acc.account.accountId;
+
+  const { accounts, activeAccountId } = await chrome.storage.local.get([
+    "accounts",
+    "activeAccountId",
+  ]);
+  if (activeAccountId && accounts?.[activeAccountId]) {
+    username = accounts[activeAccountId].username;
+    accountId = activeAccountId;
   } else if (job?.accountId) {
     username = job.username;
     accountId = job.accountId;
-  } else {
-    const { accounts, activeAccountId } = await chrome.storage.local.get([
-      "accounts",
-      "activeAccountId",
-    ]);
-    if (activeAccountId && accounts?.[activeAccountId]) {
-      username = accounts[activeAccountId].username;
-      accountId = activeAccountId;
+  }
+
+  // Fall back to querying the content script only when we still don't know the
+  // account and nothing is running (so we don't poke the job's busy tab).
+  if (!accountId && !running) {
+    const acc = await sendToBackground("getAccountInfo");
+    if (acc && acc.ok && acc.account?.accountId) {
+      username = acc.account.username;
+      accountId = acc.account.accountId;
     }
   }
+
   $("accountLabel").textContent = accountId
     ? username ? `@${username}` : `id ${accountId}`
     : "no account";
@@ -706,18 +732,127 @@ function goto(v) {
   renderChrome(lastJob);
 }
 
+// ---- Display mode (side panel <-> popup) ---------------------------------
+// Both surfaces render this same page. The ?ctx=popup marker (set for the popup
+// surface on both Chrome and Firefox) tells us which surface we're actually in,
+// which is what the toggle icon should reflect.
+let displayMode = new URLSearchParams(location.search).get("ctx") === "popup"
+  ? "popup"
+  : "sidepanel";
+
+function renderModeButton() {
+  const btn = $("modeBtn");
+  const panelIcon = $("dockIconPanel"); // chevron in = "dock to side"
+  const popupIcon = $("dockIconPopup"); // chevron out = "pop out"
+  if (!btn || !panelIcon || !popupIcon) return;
+  const isPopup = displayMode === "popup";
+  // Popup mode offers docking to the side panel; side-panel mode offers popping out.
+  panelIcon.style.display = isPopup ? "" : "none";
+  popupIcon.style.display = isPopup ? "none" : "";
+  btn.title = isPopup ? "Dock to side panel" : "Switch to popup window";
+}
+
+// Firefox exposes sidebarAction and has no chrome.sidePanel; Chrome is the
+// reverse. Feature-detect so the same button works on both engines.
+const HAS_SIDEBAR_ACTION = typeof browser !== "undefined" && !!browser.sidebarAction;
+const HAS_SIDE_PANEL = typeof chrome !== "undefined" && !!chrome.sidePanel;
+
+async function switchDisplayMode() {
+  const goToPanel = displayMode !== "sidepanel"; // currently popup -> dock to side
+  if (goToPanel) {
+    await enterPanelMode();
+  } else {
+    await enterPopupMode();
+  }
+}
+
+async function enterPanelMode() {
+  if (HAS_SIDEBAR_ACTION) {
+    // Firefox: sidebarAction.open() must be called synchronously inside the
+    // click's user gesture — any await before it (even storage) drops the
+    // gesture and Firefox silently refuses to open the sidebar. So open first,
+    // persist after, then close the popup.
+    let opened = false;
+    try { browser.sidebarAction.open(); opened = true; } catch (_) {}
+    try { browser.storage.local.set({ displayMode: "sidepanel" }); } catch (_) {}
+    if (opened) window.close();
+    return;
+  }
+  // Chrome: persist the mode first so the panel reads the right state, then open
+  // it while we still hold the click's user gesture (~5s activation).
+  await sendToBackground("setDisplayMode", { mode: "sidepanel" }, 4000);
+  try {
+    const win = await chrome.windows.getCurrent();
+    await chrome.sidePanel.open({ windowId: win.id });
+  } catch (_) {}
+  window.close(); // close the popup; the panel is now open
+}
+
+async function enterPopupMode() {
+  if (HAS_SIDEBAR_ACTION) {
+    // Firefox: we're running inside the sidebar page, so we can't close it here
+    // (that would destroy this context before the popup opens). Hand off to the
+    // background, which closes the sidebar and then opens the popup.
+    try { browser.storage.local.set({ displayMode: "popup" }); } catch (_) {}
+    try { browser.runtime.sendMessage({ action: "openActionPopup" }); } catch (_) {}
+    return;
+  }
+  // Chrome: rebind the toolbar icon to the anchored popup, then close THIS panel
+  // and let the background open the popup afterwards. Opening it from here fails
+  // because closing the panel steals focus and dismisses the popup; openPopup()
+  // needs no user gesture, so the background does it once the panel is gone. If
+  // that fails (old Chrome), the next toolbar-icon click opens the bound popup.
+  try {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+    await chrome.action.setPopup({ popup: "popup.html?ctx=popup" });
+  } catch (_) {}
+  try { chrome.storage.local.set({ displayMode: "popup" }); } catch (_) {}
+  let windowId;
+  try { windowId = (await chrome.windows.getCurrent()).id; } catch (_) {}
+  // Await the message so it's actually delivered before window.close() tears
+  // down this context. The background replies immediately, then opens the popup
+  // after a short delay (once this panel has finished closing).
+  try { await chrome.runtime.sendMessage({ action: "openActionPopup", windowId }); } catch (_) {}
+  window.close(); // close the panel; the background opens the popup next
+}
+
+async function setupModeButton() {
+  const btn = $("modeBtn");
+  // Firefox can't rebind the toolbar icon and the popup<->sidebar toggle is
+  // unreliable there, so hide the button and let users open the sidebar via the
+  // native Firefox sidebar controls.
+  if (HAS_SIDEBAR_ACTION) {
+    if (btn) btn.style.display = "none";
+    return;
+  }
+  // displayMode is already derived from the ?ctx marker (the surface we're in).
+  // On Chrome without that marker, fall back to the persisted mode.
+  if (new URLSearchParams(location.search).get("ctx") !== "popup") {
+    const res = await sendToBackground("getDisplayMode", {}, 4000);
+    if (res && res.mode) displayMode = res.mode;
+  }
+  renderModeButton();
+  if (btn) btn.addEventListener("click", switchDisplayMode);
+}
+
 function wire() {
   // View navigation.
   $("brandBack").addEventListener("click", () => goto("home"));
   $("goActivity1").addEventListener("click", () => goto("activity"));
   $("goActivity2").addEventListener("click", () => goto("activity"));
 
-  // Detect current page.
-  $("detectBtn").addEventListener("click", async () => {
+  // The side panel stays open across navigation, so a one-shot detect at load
+  // goes stale. Re-detect (and refresh the "+ current page" suggestion) whenever
+  // the user switches tabs, a page finishes loading, or they refocus the panel.
+  const redetect = async () => {
     await detectContext();
-    if (currentContext) addContextToInput();
     renderRunChips();
+  };
+  chrome.tabs.onActivated.addListener(redetect);
+  chrome.tabs.onUpdated.addListener((_id, info) => {
+    if (info.status === "complete" || info.url) redetect();
   });
+  window.addEventListener("focus", redetect);
 
   // Unified input.
   $("runInput").addEventListener("input", renderRunChips);
@@ -804,11 +939,17 @@ function wire() {
       await renderLogs();
       return;
     }
-    const res = await sendToBackground("startJob", {
-      job: { type: "follow", param: { items } },
-    });
-    if (!res?.ok) {
-      await appendLogStore("error", startError(res?.error));
+    // User-initiated: give the background time to inject + detect the account
+    // (can take a few seconds on a still-loading tab). A null here means the
+    // round-trip timed out, NOT that the start failed — so we only surface an
+    // explicit {ok:false}; otherwise we optimistically refresh.
+    const res = await sendToBackground(
+      "startJob",
+      { job: { type: "follow", param: { items } } },
+      20000
+    );
+    if (res && !res.ok) {
+      await appendLogStore("error", startError(res.error));
       await renderLogs();
     } else {
       await refreshState();
@@ -818,26 +959,29 @@ function wire() {
   // Job controls.
   $("pauseBtn").addEventListener("click", async () => {
     const status = (lastJob && lastJob.status) || "idle";
-    await sendToBackground(status === "paused" ? "resume" : "pause");
+    await sendToBackground(status === "paused" ? "resume" : "pause", {}, 10000);
     await refreshState();
   });
   $("stopBtn").addEventListener("click", async () => {
-    await sendToBackground("stop");
+    await sendToBackground("stop", {}, 10000);
     await refreshState();
   });
 
   // Maintenance.
   $("reconcileNow").addEventListener("click", async () => {
-    const res = await sendToBackground("reconcileNow");
-    if (res?.ok) await appendLogStore("info", "Started: reconcile follow-backs");
-    else if (res?.reason === "none-to-unfollow")
+    const res = await sendToBackground("reconcileNow", {}, 20000);
+    if (res == null) await refreshState(); // timed out; assume it kicked off
+    else if (res.ok) await appendLogStore("info", "Started: reconcile follow-backs");
+    else if (res.reason === "none-to-unfollow")
       await appendLogStore("info", "No follow-backs to unfollow");
-    else await appendLogStore("error", startError(res?.reason));
+    else await appendLogStore("error", startError(res.reason));
     await renderLogs();
   });
   $("cleanupNow").addEventListener("click", async () => {
-    const res = await sendToBackground("cleanupNow");
-    if (res?.ok) {
+    const res = await sendToBackground("cleanupNow", {}, 20000);
+    if (res == null) {
+      await refreshState(); // timed out; assume it kicked off
+    } else if (res.ok) {
       await appendLogStore(
         "info",
         res.reason === "none-to-unfollow"
@@ -923,6 +1067,7 @@ function triggerDownload(blob, name) {
 // ---- Init ----------------------------------------------------------------
 async function init() {
   wire();
+  await setupModeButton();
   await loadSettings();
   await detectContext();
   renderRunChips();

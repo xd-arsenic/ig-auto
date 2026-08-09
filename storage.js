@@ -7,6 +7,7 @@
   "use strict";
 
   const DEFAULT_SETTINGS = {
+    humanLevel: 50,              // backs the Simple-mode slider (popup only)
     minDelayMs: 3000,
     maxDelayMs: 8000,
     sessionCap: 100,
